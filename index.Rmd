@@ -1,0 +1,311 @@
+---
+title: "Practical Machine Learning Project"
+author: "Tom Ritch"
+date: "January 24, 2017"
+output: html_document
+---
+
+### Synopsis
+
+This report makes use of the dataset from a study titled "Qualitative Activity Recognition of Weight Lifting Exercises".^1^  Six male subjects, ages ranging 20 - 28 years, wore special athletic equipment fitted with accelerometers (weight belt, glove and armband).  In addition, an accelerometer was placed on the dumbbell. The subjects performed dumbbell lifts correctly (class A) and incorrectly (classes B, C, D, E). This report will evaluate several machine learning models that attempt to predict the manner in which a human subject is performing a dumbbell lift exercise.
+
+^1^Qualitative Activity Recognition of Weight Lifting Exercises (Velloso, Bulling, Gellersen, Ugulino, Fuks); ACM SIGCHI, 2013.
+
+### Exploratory Analysis
+
+```{r setup, echo=F, results='hide', include=F, message=F, warning=F}
+rm(list=grep("t[sr][nt]", ls(), value=T, invert=T))  # clear workspace
+knitr::opts_chunk$set(echo = TRUE, cache = TRUE, table_counter=TRUE)
+library(caret);library(ggplot2); library(corrplot); library(htmlTable); library(gridExtra)
+library(e1071); library(rpart.plot); library(kernlab); library(randomForest)
+library(gbm); library(survival); library(splines); library(parallel)
+# Set working directory, fetch data to it
+dataDirName <- "C:/Users/tom/Documents/DataScience/course 8/project" # edit this path
+setwd(dataDirName)  # make it working directory
+# skip downloads if objects exist; otherwise, download and assign
+if( !exists("data", inherits = FALSE) ) {
+    url <- "https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv"
+    download.file( url, destfile="training.csv", mode = "wb")
+    data <- read.csv("./training.csv", header=T, sep=",")
+}
+if( !exists("tst", inherits = FALSE) ) {
+    url <- "https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv"
+    download.file( url, destfile="testing.csv", mode = "wb")
+     final.test <- read.csv("./testing.csv", header=T, sep=",") # final predictive test dataset
+}
+```
+
+The dataset includes summary statistics calculated at a measurement boundary - these are very sparse and/or contain very high proportions of missing and/or error values.  We note that columns 1:7 include an observation id, subject name, and time information.  The information content in these is low, so they will be discarded.
+
+```{r explore1, eval=T}
+div0 <- apply(data, 2, function(x) sum(x=="#DIV/0!", na.rm = T)>0)  # elimination vectors
+blank <- apply(data, 2, function(x) sum(x=="", na.rm = T)>0)  # missing numbers scanning
+NAs <- apply(data, 2, function(x) sum(is.na(x))>0 )  # NAs scanning
+hiValue <- c(rep(TRUE, 7), rep(FALSE, length(names(data))-7))
+elim <- names(data[, ( div0|blank|NAs|hiValue )])
+elimVar <- c(); nC <- 5  # table of discarded variables for Backup Material
+names <- c(paste0("` ", elim, " `"), rep("...",3)); nV <- length(names)
+for(i in 1:nC) elimVar <- cbind(elimVar, names[seq(1,nV,nV/nC)[i] : (seq(1,nV,nV/nC)+(nV/nC-1))[i]])
+data <- data[, !( div0|blank|NAs|hiValue )] # eliminate variables listed above
+allVars <- names(data) # list of all variables
+allPreds <- allVars[-grep("classe", allVars)] # list of all predictors
+nzr <- nearZeroVar(data, saveMetrics = T)
+if(any(!is.na(data)) & any(!nzr$zeroVar) & any(!nzr$nzv)) 
+     cat("No missing values, no zero / near zero variance predictors remaining after eliminations")
+```
+
+Summary statistics have been eliminated except for four total acceleration variables.  Remaining predictors represent raw numeric data from sensors attached to the test subject forearm, arm, belt, and to the dumbbell.  The 53 remaining variables are presented in the **Backup Material** section.  We will not need to consider zero or near-zero variance predictors in our model development per the analysis above.
+
+#### Comments on Exploratory Graphs, Sensor Data Correlation, Predictor Skewness
+
+The reader is referred to **Exploratory Graphs** in **Backup Material** to explore characteristics of the training dataset.  The complexity of the associations between response and predictors is displayed in **Exploratory Scatterplots - Arm Accelerometer, Magnetometer sensors**, which plots associations between `classe` response and arm mounted magnetometer and accelerometer sensors.  
+
+Is there significant collinearity among remaining predictors?  Refer to the **Correlation map, ALL training predictors** in **Backup Material**.  As shown, there exist mild to strong positive and negative correlations with sensor signals from the same location, but the author has chosen to not optimize further, and to err on the side of over-production of features to maximize the ranges presented to the machine learning algorithms discussed later in this report.
+
+Skewness of remaining predictors is presented in **Skewness Analysis** in **Backup Material**.
+
+### Splitting
+
+The dataset will be split 70/30 into training and testing datasets labeled `trn` and `tst` respectively.  `trn` will be used to build and tune the model;  `tst` will be used to estimate the model predictive performance.  Variables in `trn` and `tst` are listed in **Backup Material**.  `classe` (a factor) is the response.
+
+```{r splitting}
+set.seed(1);  inTrain <- createDataPartition(y = data$classe, p = 0.7, list = FALSE)
+trn <- data[inTrain, ] # 70% to trn
+tst <- data[-inTrain, ] # 30% to tst
+cat("trn:", dim(trn)[1], "observations by", dim(trn)[2], "variables;  tst:",
+    dim(tst)[1], "observations by", dim(tst)[2], "variables")
+```
+
+### Model Development
+
+The author fit five models for this supervised learning classification problem: (1) a CART decision tree, (2) a generalized boosted model, (3) a support vectors machine, (4) a random forest model invoked without train(), but for which tunable parameters were determined by way of the last model (5), a random forest model invoked within train().  Optimal tuning parameters are discussed below.
+
+#### Decision Tree Model
+
+We evaluate a CART decision tree, using train() method `rpart`.  52 variables were centered and scaled, of which 19 important variables were identified.  Cross-validation parameters used:  10 folds, repeated 10 times.
+```{r dtModel, eval=T}
+set.seed(1); dTreeModel <- train(classe ~ ., method="rpart", data=trn, preProcess=c("center", "scale"))
+dTreeModelPred <- predict(dTreeModel, newdata=tst, na.action = na.pass)  # predict w tst
+cmDT <- confusionMatrix(dTreeModelPred, tst$classe)
+```
+
+#### Generalized Boosted Model
+
+We now evaluate a Generalized Boosted Model tuned with train().  After some experimentation, the best tune was `n.trees`=150, `interaction.depth`=3, `shrinkage`=0.1.  Cross-validation parameters:  10 folds, repeated 10 times.
+
+```{r GBModel, eval=T}
+set.seed(1); gbModel <- suppressMessages(train(classe ~ . , data=trn, method='gbm', metric='Accuracy',
+     preProcess=c("center", "scale"), verbose=F, trControl=trainControl(method="repeatedcv", repeats=10)))
+gbModelPred <- predict(gbModel, newdata=tst) # prediction with testing dataset
+cmGB <- confusionMatrix(gbModelPred, tst$classe)
+```
+
+<P style="page-break-before: always">
+
+#### Support Vector Machine Model
+
+We now evaluate a Support Vector Machine with Radial Basis Function Kernel model tuned with train(), `tuneLength=12`, and `method=svmRadial`.  Fine tuning from multiple svm fits with sigma and C parameter ranges in expand.grid() identified these tuning parameters used in the calculation below.  We avoided over-fitting with cross-validation (10 fold, repeated 10 times).
+
+```{r svmModel, eval=T}
+set.seed(1); gridSVM <- expand.grid(sigma=0.01228219, C=513)
+svmModel <- train(classe ~ . , data = trn, method = "svmRadial", preProc = c("center", "scale"),
+     tuneGrid = gridSVM, trControl = trainControl(method = "repeatedcv", repeats = 10))
+svmModelPred <- predict(svmModel, newdata=tst) # prediction with testing dataset
+cmSVM <- confusionMatrix(svmModelPred, tst$classe)
+```
+
+#### Random Forest Models
+
+Two random forest models were created.  The first (RF1) call was invoked as randomForest(), and performs well with default parameters.  It was tuned after experimentation on RF2, specifically by using expand.grid() to hunt for `ntree` and `mtry`.  Model features common to both RF1 and RF2 are `ntree=500` trees, `mtry=8`, and no pre-processing.  In addition, we compensated for over-fitting on RF2 with cross-Validation (10 fold, 10 repeats).
+
+```{r RF, eval=T}
+# random forest model 1
+set.seed(1)
+RF1 <- randomForest(classe ~ ., trn, mtry=8, importance=T)
+RF1Pred <- predict(RF1, newdata=tst)
+cmRF1 <- confusionMatrix(RF1Pred, tst$classe)
+# random forest model 2
+grid <- expand.grid(.mtry=8)  # Grid Search for best tune mtry value
+RF2 <- train(classe ~ . , data=trn, method="rf", metric='Accuracy', tuneGrid=grid, ntree=500,
+     trControl=trainControl(method="repeatedcv", number=10, repeats=10, search="grid"))
+RF2Pred <- predict(RF2, newdata=tst)
+cmRF2 <- confusionMatrix(RF2Pred, tst$classe)
+```
+
+### Model Comparisons
+
+```{r AccCompare, eval=T}
+# table of 95% confidence intervals for model accuracy
+accuracyTbl <- round(100*cmDT$overall[3:4],1)
+accuracyTbl <- rbind(accuracyTbl, round(100*cmGB$overall[3:4],1))
+accuracyTbl <- rbind(accuracyTbl, round(100*cmSVM$overall[3:4],1))
+accuracyTbl <- rbind(accuracyTbl, round(100*cmRF1$overall[3:4],1))
+accuracyTbl <- rbind(accuracyTbl, round(100*cmRF2$overall[3:4],1))
+row.names(accuracyTbl) <- c('Decision Tree', 'Generalized Boosted', 'Support Vector Machine',
+	'RandomForest 1', 'RandomForest 2')
+htmlTable(accuracyTbl, caption='**Comparisons of model accuracy, 95% confidence intervals**')
+```
+
+<P style="page-break-before: always">
+
+The last four models listed above were the highest performing of the five evaluated.  For those four, we continue with a comparison of confusion matrices, out-of-box error rate, and out-of-sample error rate for the four high performing models.  The confusion matrices are combined below.
+
+```{r CMCompare, eval=T}
+# concatenate all confusion matrices
+labs <- paste0("| ", rownames(cmSVM$table)); aln <- paste0(rep('lccccc',4))
+hdr <- paste0('..',substring(labs, 3),'..')
+tbl <- cbind(labs, cmGB$table, labs, cmSVM$table, labs, cmRF1$table, labs, cmRF2$table)
+htmlTable(tbl, header=c('[ GB ]', hdr,'[ SVM ]', hdr, '[ RF1 ]', hdr,'[ RF2 ]', hdr),
+	rnames=F, align=aln, header.align=aln, caption="**Confusion Matrices, Four Models**")
+```
+
+#### Out-of-Box error rate model comparisons
+
+```{r OOBCompare, eval=T}
+# OOB is ratio of misclassified to total training observations in confusion matrix
+sumTrainObserv <- dim(trn)[1]  # total training observations
+GBConfusion <- confusionMatrix(predict(gbModel, newdata=trn), trn$classe) # Decision Tree
+sumMisclassified.GB <- sumTrainObserv-sum(diag(GBConfusion$table))
+OOB.GB <- round(sumMisclassified.GB / sumTrainObserv, 5)
+SVMConfusion <- confusionMatrix(predict(svmModel, newdata=trn), trn$classe) # Support Vectors Machine
+sumMisclassified.SVM <- sumTrainObserv-sum(diag(SVMConfusion$table))
+OOB.SVM <- round(sumMisclassified.SVM / sumTrainObserv, 5)
+RF1Confusion <- with(RF1, confusion[1:nrow(confusion),1:nrow(confusion)])  # RF1
+sumMisclassified.RF1 <- sumTrainObserv-sum(diag(RF1Confusion))
+OOB.RF1 <- round(sumMisclassified.RF1 / sumTrainObserv, 5)
+sumMisclassified.RF2 <- sumTrainObserv-sum(diag(RF2$finalModel$confusion))  # RF2
+OOB.RF2 <- round(sumMisclassified.RF2 / sumTrainObserv, 5)
+# comparison table
+htmlTable(c(OOB.GB, OOB.SVM, OOB.RF1, OOB.RF2),
+     header=c('| Generalized Boost |', '| Support Vector Machine |', '| RandForest1 |', '| RandForest2 |'),
+     caption='**Out-of-Box Error Rate Comparison, Four Models**', rnames=F)
+```
+
+Refer to the table above - note that the two random forest methods yielded very accurate fits and similar results, but were out-performed on this training set by the support vector machine.
+
+<P style="page-break-before: always">
+
+#### Out-of-Sample error rate model comparisons
+
+```{r OOSCompare, eval=T}
+# OOS is (1 - Accuracy) of fit to testing set observations
+OOS.GB <- round(1-cmGB$overall[1],5); OOS.SVM <- round(1-cmSVM$overall[1],5)
+OOS.RF1 <- round(1-cmRF1$overall[1],5); OOS.RF2 <- round(1-cmRF2$overall[1],5)
+htmlTable(c(OOS.GB, OOS.SVM, OOS.RF1, OOS.RF2),
+     header=c('| Generalized Boost |', '| Support Vector Machine |', '| RandForest1 |', '| RandForest2 |'),
+     caption='**Out-of-Sample Error Rate Comparison, Four Models**', rnames=F)
+```
+
+Refer to the table above.  Previously, the support vector machine out-performed based on OOB error rate, but when out-of-sample (OOS) rates are compared, the random forest models out-perform.  So we see a slightly different result when the models are evaluated with the test dataset.  Again, both random forest models deliver similar results, but the trained random forest (RF2) method outperforms slightly.
+
+### Final Test:  Evaluate Performance
+
+The `pml-testing.csv` dataset includes 20 observations that will used to evaluate predictive performance.
+```{r finalTest, eval=T}
+gbPred.FT <- predict(gbModel, newdata=final.test, na.action = na.pass)  # evaluate on `final.test`
+svmPred.FT <- predict(svmModel, newdata=final.test)
+RF1Pred.FT <- predict(RF1, newdata=final.test)
+RF2Pred.FT <- predict(RF2, newdata=final.test)
+eq <- ifelse(gbPred.FT==svmPred.FT & svmPred.FT==RF1Pred.FT & RF1Pred.FT==RF2Pred.FT, 'T', 'F')
+space <- rep('...' , 20)
+htmlTable(t(data.frame('GB'=gbPred.FT, 'SVM'=svmPred.FT, 'RF1'=RF1Pred.FT, 'RF2'=RF2Pred.FT,
+     space, 'Equal'=eq, fix.empty.names=F)), header=c(paste0('Ob','0',(1:9)), paste0('Ob',(10:20))))
+```
+
+Refer to the table above.  Each of the four highest-performing models yield identical predictions for the twenty observation test dataset.
+
+Expanded version of this report:  http://rpubs.com/tomritch/Machine_Learning_Weightlifting_Exercises
+
+<P style="page-break-before: always">
+
+### **Backup Material**
+
+#### **Correlation map, ALL training predictors**
+
+**Exploratory Analysis** referred the reader to the correlation plots in this section.  Plots are provided for correlations for (1) all training dataset predictors below.
+
+```{r backup2, eval=T, fig.align="center", fig.width=9, fig.height=9}
+# correlation maps for ALL training predictors, plot order: first principal component order
+corrplot(cor(trn[, allPreds]), tl.cex=.8, tl.col="firebrick", order="FPC",
+         method="ellipse", type="full", sig.level=0.05, tl.pos="lt", cl.pos="n")
+```
+
+<P style="page-break-before: always">
+
+#### **Exploratory Graphs**
+
+##### **Exploratory Scatterplots - Arm Accelerometer, Magnetometer sensors**
+
+```{r backup4, fig.align="center", fig.width=9.5, fig.height=9}
+what <- (grepl("accel_arm", allPreds)|grepl("magnet_arm", allPreds))&!grepl("total", allPreds)
+featurePlot(x=trn[,what], y=trn$classe, plot = "pairs", auto.key = list(columns = 5),
+    pch='.', alpha=.5, cex=.2, aspect=.75, main="Exploratory Scatterplots - Arm Accelerometer, Magnetometer Sensors")
+```
+
+<P style="page-break-before: always">
+
+##### **Exploratory Boxplots - Accelerometer, Magnetometer sensors**
+
+```{r backup5, fig.align="center", fig.width=9.5, fig.height=9}
+locs <- c("_arm", "_forearm", "_belt", "_dumbbell")  # sensor locations
+plotIt <- function(feat) featurePlot(x=trn[ , feat], y=trn$classe, "box", label=NULL)
+featGrep <- function(loc, f1, f2, f3, not)
+	  grepl(loc,allPreds)&!grepl(not,allPreds)&(grepl(f1,allPreds)|grepl(f2,allPreds)|grepl(f3,allPreds))
+p1 <- plotIt(featGrep(locs[1], "magnet_", "accel_","accel_","total_accel_"))
+p2 <- plotIt(featGrep(locs[2], "magnet_", "accel_","accel_","total_accel_"))
+p3 <- plotIt(featGrep(locs[3], "magnet_", "accel_","accel_","total_accel_"))
+p4 <- plotIt(featGrep(locs[4], "magnet_", "accel_","accel_","total_accel_"))
+p5 <- plotIt(grepl("total_accel_", allPreds))
+grid.arrange(p1, p2, p3, p4, p5, heights=c(3.75,3.75,3))
+```
+
+<P style="page-break-before: always">
+
+##### **Exploratory Boxplots - Gyroscopic sensors**
+
+```{r backup6, fig.align="center", fig.width=9.5, fig.height=9}
+p6 <- plotIt(featGrep(locs[1], "gyros_", "gyros_","gyros_","total_accel_"))
+p7 <- plotIt(featGrep(locs[2], "gyros_", "gyros_","gyros_","total_accel_"))
+p8 <- plotIt(featGrep(locs[3], "gyros_", "gyros_","gyros_","total_accel_"))
+p9 <- plotIt(featGrep(locs[4], "gyros_", "gyros_","gyros_","total_accel_"))
+grid.arrange(p6, p7, p8, p9)
+```
+
+<P style="page-break-before: always">
+
+##### **Exploratory Boxplots - Roll/Pitch/Yaw sensors**
+
+```{r backup7, fig.align="center", fig.width=9.5, fig.height=9}
+p10 <- plotIt(featGrep(locs[1], "roll_", "pitch_","yaw_","total_accel_"))
+p11 <- plotIt(featGrep(locs[2], "roll_", "pitch_","yaw_","total_accel_"))
+p12 <- featurePlot(trn[ , allPreds[featGrep(locs[3], "roll_", "pitch_","yaw_",
+	  "total_accel_")]], trn$classe, "box", label=NULL) # workaround
+p13 <- plotIt(featGrep(locs[4], "roll_", "pitch_","yaw_","total_accel_"))
+grid.arrange(p10, p11, p12, p13)
+```
+
+<P style="page-break-before: always">
+
+##### **Skewness Analysis**
+
+```{r skewness1, fig.align="center", fig.width=9.5, fig.height=6}
+skew <- function(x) round(abs(skewness(x)),2);  skew <- apply(trn[,allPreds], 2, skew)
+skew <- skew[order(-skew)]
+predSkew <- data.frame(Predictor=paste0("` ", names(skew), " `"), Skew=skew)
+row.names(predSkew) <- NULL; n <- dim(predSkew)[1]
+htmlTable(cbind(predSkew[1:(n/4),], predSkew[(n/4+1):(2*n/4),],
+	predSkew[(2*n/4+1):(3*n/4),], predSkew[(3*n/4+1):n,]), align.header=rep('l',8),
+	rnames=F, align=rep('l',8),  caption="***Sorted Predictor Skew***")
+```
+
+##### **List of Remaining Variables Post-Eliminations**
+
+The variable elimination process described in the **Exploratory Analysis** section yielded the following variables remaining for model development, including the outcome `classe`.
+```{r backup1, echo=T}
+tbl<-c(); nC <- 6; names <- c(paste0("` ", allVars[order(allVars)], " `"), rep("...",1))
+nV <- length(names)
+for(i in 1:nC)
+	tbl <- cbind(tbl, c(names[seq(1, nV, nV/nC)[i] : (seq(1, nV, nV/nC)+(nV/nC-1))[i]]))
+htmlTable::htmlTable(tbl, align='llllll', header=c(rep("",6)),
+              caption="***Remaining variables in dataset (alphabetical order)***")
+```
